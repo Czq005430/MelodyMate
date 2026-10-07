@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { encodeWav } from "../lib/wav.ts";
+import { encodeWav, encodeWavChannels } from "../lib/wav.ts";
 
 test("输出标准单声道 PCM16 WAV 头和正确数据长度", () => {
   const wav = encodeWav(new Float32Array(44100), 44100);
@@ -36,4 +36,24 @@ test("WAV 拒绝非有限 PCM、空音频和无效采样率", () => {
   assert.throws(() => encodeWav(new Float32Array([Infinity]), 44100), /PCM/);
   assert.throws(() => encodeWav(new Float32Array(0), 44100), /音频/);
   assert.throws(() => encodeWav(new Float32Array([0]), 0), /采样率/);
+});
+
+test("双声道PCM16按左右交错，头部反映双声道帧大小", () => {
+  const left = new Float32Array([1, -.5, 0]), right = new Float32Array([-.25, .5, -1]);
+  const wav = encodeWavChannels([left, right], 48000), view = new DataView(wav);
+  assert.equal(wav.byteLength, 56);
+  assert.equal(view.getUint16(22, true), 2);
+  assert.equal(view.getUint32(28, true), 192000);
+  assert.equal(view.getUint16(32, true), 4);
+  assert.equal(view.getUint32(40, true), 12);
+  assert.deepEqual(Array.from({ length: 6 }, (_, i) => view.getInt16(44 + 2 * i, true)), [32767, -8192, -16384, 16384, 0, -32768]);
+  assert.deepEqual(encodeWavChannels([left], 48000), encodeWav(left, 48000));
+  assert.deepEqual(right, new Float32Array([-.25, .5, -1]));
+});
+
+test("多声道导出拒绝缺失、长度不齐和非有限的声道", () => {
+  assert.throws(() => encodeWavChannels([], 44100), /声道|音频/);
+  assert.throws(() => encodeWavChannels([new Float32Array(1), new Float32Array(2)], 44100), /声道|长度/);
+  assert.throws(() => encodeWavChannels([new Float32Array(1), new Float32Array([NaN])], 44100), /PCM/);
+  assert.throws(() => encodeWavChannels([new Float32Array(1)], 0), /采样率/);
 });

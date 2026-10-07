@@ -4,6 +4,7 @@ import { useRef, useState } from "react";
 import GuidedRecorder from "./GuidedRecorder";
 import HelpCard from "./HelpCard";
 import CodexHandoff from "./CodexHandoff";
+import CloudMusicPanel from "./CloudMusicPanel";
 import { useSongStudio } from "../lib/use-song-studio.ts";
 import { sectionTimings, songDuration } from "../lib/song-plan.ts";
 import { roleLabels } from "../lib/recording-analysis.ts";
@@ -31,7 +32,7 @@ export default function SongStudio() {
   return <div className="song-shell">
     <header className="app-header"><div className="brand"><div className="brand-mark" aria-hidden="true">m<span>m</span></div><div><h1>MelodyMate<span className="brand-dot">.</span></h1><p>把生活，做成音乐</p></div></div><div className="song-header-meta"><span className="song-live-dot" /> 本机创作室 <a href="/loop" target="_blank" rel="noreferrer">四小节实验台 ↗</a></div></header>
     <div className="song-hero"><div><span className="eyebrow">FOUND SOUNDS / YOUR FIRST SONG</span><h2>一声日常，<br />一首属于你的音乐。</h2><p>录下身边的声音，把节奏交给我们整理，<br />和 Codex 一起编成至少两分钟的器乐作品。</p></div><div className="song-first-step"><span className="song-small-label">第一次来？从这里开始</span><p>先用示例听听能做成什么，<br />再把其中一种换成你的声音。</p><button className="button button-primary" disabled={studio.busy} onClick={studio.loadExamples}>载入三种示例声音 <span aria-hidden="true">↗</span></button><small>示例为合成敲击声 · 不需要打开麦克风</small></div></div>
-    <nav className="song-route" aria-label="创作步骤"><a href="#song-sounds"><b>01</b><span>收集声音<small>先录一种就可以开始</small></span></a><a href="#song-arrangement"><b>02</b><span>听见雏形<small>节奏、钢琴与分段变化</small></span></a><a href="#song-codex"><b>03</b><span>一起改编<small>向 Codex 描述你的想法</small></span></a></nav>
+    <nav className="song-route" aria-label="创作步骤"><a href="#song-sounds"><b>01</b><span>收集声音<small>先录一种就可以开始</small></span></a><a href="#song-arrangement"><b>02</b><span>听见雏形<small>本地节奏与分段变化</small></span></a><a href="#song-codex"><b>03</b><span>一起改编<small>向 Codex 描述你的想法</small></span></a><a href="#song-cloud"><b>04</b><span>Suno 伴奏<small>生成或导入，再加入原声</small></span></a></nav>
     {studio.notice && <div className="song-notice" role="status">{studio.notice}</div>}
     <main className="song-workspace">
       <section className="song-panel song-sounds" id="song-sounds" aria-labelledby="song-sounds-title"><div className="song-section-heading"><span>01 / COLLECT</span><h2 id="song-sounds-title">声音是你的主角</h2><p>为身边的声音找一个位置。录一种即可，其余可以慢慢补。</p></div>
@@ -59,7 +60,8 @@ export default function SongStudio() {
         <HelpCard title="这次的 AI 到底做了什么？" role="本机 Codex 负责理解想法和编曲，不直接生成音频"><p>Codex 读取段落、节奏和录音分析摘要，提出新的和弦、配器及结构；浏览器用你的声音和钢琴采样把它演奏出来。原始录音不通过页面工具上传，Codex 也没有直接听见录音。</p><p>这里复用当前 Codex 对话；页面本身不自动调用模型。每次修改先成为提案，由你试听和采纳。本地初稿随时可用。</p></HelpCard>
       </aside>
     </main>
-    <div className="song-footnote"><span>声音留在浏览器 · 工程只保留在当前页面，刷新前请导出。</span><a href="/audio/piano/SOURCES.md" target="_blank" rel="noreferrer">钢琴采样：Alexander Holm / CC BY 3.0 ↗</a></div>
+    <CloudMusicPanel plan={studio.plan} sources={studio.sources} revision={studio.revision} busy={studio.busy} localPlaying={playing} onBeforePlay={studio.stop} />
+    <div className="song-footnote"><span>原录音不上传 · {studio.storageNotice}。</span><a href="/audio/piano/SOURCES.md" target="_blank" rel="noreferrer">钢琴采样：Alexander Holm / CC BY 3.0 ↗</a></div>
     <footer className="song-player"><div className="song-player-info"><span className="song-small-label">{stateLabel}</span><strong>{studio.plan.title}</strong><div className="song-progress"><progress max={studio.duration || total} value={studio.progress} aria-label="播放进度" /><span>{clock(studio.progress)} / {clock(studio.duration || total)}</span></div></div><div className="song-player-actions"><button className="button button-primary" disabled={!hasSource || studio.busy} onClick={() => studio.play()}>▶ 播放整曲</button><button className="button button-secondary" disabled={studio.recording || studio.status === "idle"} onClick={studio.stop}>停止</button><button className="text-button" disabled={!hasSource || studio.busy} onClick={() => studio.play({ sourceOnly: true })}>只听生活声音</button><button className="text-button" disabled={!studio.canUndo || studio.busy} onClick={studio.undo}>撤销</button><button className="button button-secondary" disabled={!hasSource || studio.busy} onClick={studio.exportSong}>导出整曲</button>{studio.download && <a className="song-save" href={studio.download.url} download={studio.download.name}>保存 WAV ↓</a>}</div></footer>
   </div>;
 }

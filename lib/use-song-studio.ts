@@ -8,6 +8,7 @@ import { analyzeRecording, roleLabels } from "./recording-analysis.ts";
 import { renderRecording, renderSong } from "./song-render.ts";
 import { createSongTools, registerSongTools, type SongToolInput } from "./site-tools.ts";
 import { encodeWav } from "./wav.ts";
+import { loadSongSnapshot, saveSongSnapshot } from "./song-storage.ts";
 import type { RecordingAnalysis, SongPlan, SongProposal, SongSource, SoundRole } from "./song-types.ts";
 
 type Snapshot = { revision: number; plan: SongPlan; sources: SongSource[]; origin: "local" | "manual" | "codex" };
@@ -24,6 +25,9 @@ export function useSongStudio() {
   const [progress, setProgress] = useState(0);
   const [duration, setDuration] = useState(0);
   const [download, setDownload] = useState<{ url: string; name: string } | null>(null);
+  const [hydrated, setHydrated] = useState(false);
+  const [storageNotice, setStorageNotice] = useState("正在恢复本机工程…");
+  const saveAllowed = useRef(false);
   const player = useRef<AudioPlayer | null>(null);
   const task = useRef(0);
   const abort = useRef<AbortController | null>(null);
@@ -46,6 +50,7 @@ export function useSongStudio() {
   function clearDownload() { if (downloadUrl.current) URL.revokeObjectURL(downloadUrl.current); downloadUrl.current = null; setDownload(null); }
   function commit(plan: SongPlan, sources = current.current.sources, origin: Snapshot["origin"] = "manual") {
     const valid = validateSongPlan(plan);
+    saveAllowed.current = true;
     stop(); history.current = [...history.current, current.current].slice(-5);
     const next = { revision: current.current.revision + 1, plan: valid, sources, origin };
     current.current = next; setSnapshot(next); clearProposal(); clearDownload(); setNotice("");
@@ -81,6 +86,25 @@ export function useSongStudio() {
     }, setBridge);
     return () => { mounted.current = false; task.current++; abort.current?.abort(); player.current?.close(); cancelAnimationFrame(frame.current); disposeTools(); if (downloadUrl.current) URL.revokeObjectURL(downloadUrl.current); };
   }, []);
+  useEffect(() => {
+    let active = true; locked.current = true;
+    void loadSongSnapshot().then(saved => {
+      if (!active) return;
+      if (saved) { current.current = saved; setSnapshot(saved); }
+      saveAllowed.current = true;
+      setStorageNotice(saved ? "已恢复本机录音工程" : "录音工程会保存在本机浏览器");
+    }).catch(() => {
+      if (active) setStorageNotice("本机工程恢复失败；当前可继续创作，新录音前请确认已保留备份。");
+    }).finally(() => { if (active) { locked.current = false; setHydrated(true); } });
+    return () => { active = false; };
+  }, []);
+  useEffect(() => {
+    if (!hydrated || !saveAllowed.current) return;
+    let active = true;
+    void saveSongSnapshot(snapshot).then(() => { if (active) setStorageNotice("录音工程已保存在本机浏览器"); })
+      .catch(() => { if (active) setStorageNotice("浏览器保存失败，请在刷新前导出作品。"); });
+    return () => { active = false; };
+  }, [snapshot, hydrated]);
   function recordingBusy(value: boolean) { if (value) stop(); recordingActive.current = value; locked.current = value; setRecording(value); }
   function addSource(role: SoundRole, buffer: AudioBuffer, analysis: RecordingAnalysis, label = `我的${roleLabels[role]}声音`, example = false) {
     const source = { id: crypto.randomUUID(), role, label: label.slice(0, 60), buffer, analysis, example };
@@ -156,7 +180,7 @@ export function useSongStudio() {
     } catch (error) { if (serial === task.current) report(error); }
     finally { if (serial === task.current && mounted.current) { locked.current = false; setStatus("idle"); } }
   }
-  return { ...snapshot, proposal, status, notice, recording, bridge, lastCodex, progress, duration, download, canUndo: history.current.length > 0,
+  return { ...snapshot, proposal, status, notice, recording, bridge, lastCodex, progress, duration, download, storageNotice, canUndo: history.current.length > 0,
     projectText: JSON.stringify({ ...readProject(), proposalFormat: { baseRevision: "使用上面的revision", title: "简短标题（60字以内）", explanation: "具体变化说明（500字以内）", plan: "修改后的完整plan，须通过下面schema且总时长120～180秒、段落id唯一、首末含原声" }, planSchema: SONG_PLAN_SCHEMA }, null, 2), submitProposal,
-    busy: recording || ["loading", "exporting", "rendering"].includes(status), recordingBusy, addSource, loadExamples, loadFile, changeMood, changePlan, adopt, undo, play, stop, exportSong, report, clearProposal };
+    busy: !hydrated || recording || ["loading", "exporting", "rendering"].includes(status), recordingBusy, addSource, loadExamples, loadFile, changeMood, changePlan, adopt, undo, play, stop, exportSong, report, clearProposal };
 }
