@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { analyzeRecording } from "../lib/recording-analysis.ts";
 import { createSongPlan } from "../lib/song-plan.ts";
-import { loadSongSnapshot, restoreSongSnapshot, saveSongSnapshot, serializeSongSnapshot } from "../lib/song-storage.ts";
+import { addTake, addWork, listTakes, listWorks, loadSongSnapshot, removeTake, removeWork, restoreSongSnapshot, restoreTake, saveSongSnapshot, serializeSongSnapshot } from "../lib/song-storage.ts";
 import type { StoredSongSnapshot } from "../lib/song-storage.ts";
 
 function bufferFactory({ length, sampleRate, numberOfChannels = 1 }: AudioBufferOptions): AudioBuffer {
@@ -109,7 +109,7 @@ test("保存严格按调用顺序串行，事务中止后下一次仍可完成",
   const transactions: Transaction[] = [];
   const requests: { onsuccess?: () => void; result: unknown }[] = [];
   Object.defineProperty(globalThis, "indexedDB", { configurable: true, value: { open(name: string, version: number) {
-    assert.equal(name, "MelodyMate-song-v1"); assert.equal(version, 1);
+    assert.equal(name, "MelodyMate-song-v1"); assert.equal(version, 2);
     const request = { result: { close() {}, transaction(store: string, mode: string) {
       assert.equal(store, "snapshots"); assert.equal(mode, "readwrite");
       const transaction: Transaction = { error: null, objectStore: () => ({ put(value: unknown) {
@@ -121,7 +121,7 @@ test("保存严格按调用顺序串行，事务中止后下一次仍可完成",
   } } });
   const turn = () => new Promise(resolve => setImmediate(resolve));
   try {
-    const first = saveSongSnapshot(snapshot()); const firstFailure = assert.rejects(first, /本地工程/);
+    const first = saveSongSnapshot(snapshot()); const firstFailure = assert.rejects(first, /本地保存/);
     const next = snapshot(); next.revision = 8;
     const second = saveSongSnapshot(next); next.plan.title = "保存调用之后的修改";
     await turn(); assert.equal(requests.length, 1);
@@ -136,4 +136,96 @@ test("保存严格按调用顺序串行，事务中止后下一次仍可完成",
     if (original) Object.defineProperty(globalThis, "indexedDB", original);
     else Reflect.deleteProperty(globalThis, "indexedDB");
   }
+});
+
+function memoryDatabase() {
+  const stores = new Map<string, Map<string, unknown>>();
+  const original = Object.getOwnPropertyDescriptor(globalThis, "indexedDB");
+  Object.defineProperty(globalThis, "indexedDB", { configurable: true, value: { open(_name: string, _version: number) {
+    const request: { result?: unknown; onupgradeneeded?: () => void; onsuccess?: () => void } = {};
+    const db = {
+      objectStoreNames: { contains: (name: string) => stores.has(name) },
+      createObjectStore: (name: string) => { stores.set(name, new Map()); },
+      close() {},
+      onversionchange: null as (() => void) | null,
+      transaction(name: string, _mode: string) {
+        const store = stores.get(name);
+        if (!store) throw new Error(`缺少对象存储 ${name}`);
+        const transaction = { error: null as Error | null, oncomplete: null as (() => void) | null, onabort: null as (() => void) | null, onerror: null as (() => void) | null,
+          objectStore: () => ({
+            put(value: unknown, key?: string) { store.set(key ?? (value as { id: string }).id, structuredClone(value)); return finish(undefined); },
+            get: (key: string) => finish(store.has(key) ? structuredClone(store.get(key)) : undefined),
+            getAll: () => finish([...store.values()].map(item => structuredClone(item))),
+            delete: (key: string) => { store.delete(key); return finish(undefined); },
+          }) };
+        function finish(result: unknown) { const inner = { result }; queueMicrotask(() => transaction.oncomplete?.()); return inner; }
+        return transaction;
+      },
+    };
+    request.result = db;
+    queueMicrotask(() => { request.onupgradeneeded?.(); request.onsuccess?.(); });
+    return request;
+  } } });
+  return { stores, restore: () => { if (original) Object.defineProperty(globalThis, "indexedDB", original); else Reflect.deleteProperty(globalThis, "indexedDB"); } };
+}
+function takeSource(role: "pulse" | "accent" | "texture", seed: number) {
+  const buffer = bufferFactory({ length: 4410, sampleRate: 44100 });
+  for (let frame = 2205; frame < buffer.length; frame++) {
+    const t = (frame - 2205) / buffer.sampleRate;
+    buffer.getChannelData(0)[frame] = .6 * Math.exp(-t / .03) * Math.sin(t * Math.PI * 1200);
+  }
+  return { id: `take-${seed}`, role, label: `测试录音 ${seed}`, buffer, analysis: analyzeRecording(buffer, 96, role), example: false };
+}
+
+test("录音历史独立于当前工程：重录覆盖后旧的一条仍可取回", async () => {
+  const db = memoryDatabase();
+  try {
+    await addTake(takeSource("pulse", 1));
+    await addTake(takeSource("pulse", 2));
+    const list = await listTakes();
+    assert.equal(list.length, 2);
+    assert.equal(list[0].id, "take-2");
+    const restored = restoreTake(list[1], bufferFactory);
+    assert.equal(restored.role, "pulse");
+    assert.ok(restored.buffer.getChannelData(0).some(value => value !== 0));
+    await removeTake(list[0].id);
+    assert.deepEqual((await listTakes()).map(item => item.id), ["take-1"]);
+  } finally { db.restore(); }
+});
+
+test("录音历史超过上限清理最旧条目，损坏条目被跳过并在下次写入时清除", async () => {
+  const db = memoryDatabase();
+  try {
+    for (let seed = 1; seed <= 12; seed++) await addTake(takeSource("pulse", seed));
+    assert.equal((await listTakes()).length, 12);
+    await addTake(takeSource("accent", 13));
+    const list = await listTakes();
+    assert.equal(list.length, 12);
+    assert.ok(!list.some(item => item.id === "take-1"));
+    db.stores.get("takes")!.set("broken", { id: "broken" });
+    assert.equal((await listTakes()).length, 12);
+    await addTake(takeSource("texture", 14));
+    assert.ok(!(await listTakes()).some(item => item.id === "broken"));
+  } finally { db.restore(); }
+});
+
+test("导出作品可往返读取，超过六份清理最旧，空音频被拒绝", async () => {
+  const db = memoryDatabase();
+  try {
+    await assert.rejects(addWork({ kind: "song", label: "空作品", seconds: 120, bytes: new Uint8Array(0) }), /作品音频/);
+    for (let seed = 1; seed <= 6; seed++) await addWork({ kind: seed % 2 ? "song" : "mix", label: `作品 ${seed}`, seconds: 120, bytes: Uint8Array.from([seed, seed]) });
+    assert.equal((await listWorks()).length, 6);
+    await addWork({ kind: "mix", label: "作品 7", seconds: 130, bytes: Uint8Array.from([7]) });
+    const list = await listWorks();
+    assert.equal(list.length, 6);
+    assert.equal(list[0].label, "作品 7");
+    assert.ok(!list.some(item => item.label === "作品 1"));
+    assert.deepEqual([...list[0].bytes], [7]);
+    await addWork({ kind: "cloud", id: "cloud-fixed", label: "云端生成", seconds: 140, bytes: Uint8Array.from([9]) });
+    await addWork({ kind: "cloud", id: "cloud-fixed", label: "云端生成", seconds: 145, bytes: Uint8Array.from([9, 9]) });
+    const deduped = (await listWorks()).filter(item => item.id === "cloud-fixed");
+    assert.equal(deduped.length, 1); assert.equal(deduped[0].seconds, 145);
+    await removeWork(list[0].id);
+    assert.equal((await listWorks()).length, 5);
+  } finally { db.restore(); }
 });

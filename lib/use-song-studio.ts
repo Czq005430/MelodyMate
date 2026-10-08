@@ -3,12 +3,12 @@
 import { useEffect, useRef, useState } from "react";
 import { AudioPlayer } from "./audio-playback.ts";
 import { createDemoSample } from "./demo-samples.ts";
-import { createSongPlan, songDuration, validateSongPlan, SONG_PLAN_SCHEMA } from "./song-plan.ts";
+import { applyHarmony, createSongPlan, harmonyPreset, matchHarmony, songDuration, validateSongPlan, SONG_PLAN_SCHEMA } from "./song-plan.ts";
 import { analyzeRecording, roleLabels } from "./recording-analysis.ts";
 import { renderRecording, renderSong } from "./song-render.ts";
 import { createSongTools, registerSongTools, type SongToolInput } from "./site-tools.ts";
 import { encodeWav } from "./wav.ts";
-import { loadSongSnapshot, saveSongSnapshot } from "./song-storage.ts";
+import { addTake, addWork, listTakes, listWorks, loadSongSnapshot, removeTake, removeWork, restoreTake, saveSongSnapshot, type StoredTake, type StoredWork } from "./song-storage.ts";
 import type { RecordingAnalysis, SongPlan, SongProposal, SongSource, SoundRole } from "./song-types.ts";
 
 type Snapshot = { revision: number; plan: SongPlan; sources: SongSource[]; origin: "local" | "manual" | "codex" };
@@ -27,6 +27,8 @@ export function useSongStudio() {
   const [download, setDownload] = useState<{ url: string; name: string } | null>(null);
   const [hydrated, setHydrated] = useState(false);
   const [storageNotice, setStorageNotice] = useState("正在恢复本机工程…");
+  const [takes, setTakes] = useState<StoredTake[]>([]);
+  const [works, setWorks] = useState<StoredWork[]>([]);
   const saveAllowed = useRef(false);
   const player = useRef<AudioPlayer | null>(null);
   const task = useRef(0);
@@ -37,6 +39,7 @@ export function useSongStudio() {
   const recordingActive = useRef(false);
   const previewActive = useRef(false);
   const downloadUrl = useRef<string | null>(null);
+  const workUrls = useRef(new Map<string, string>());
   const proposalRef = useRef<SongProposal | null>(null);
 
   function stop() {
@@ -46,6 +49,11 @@ export function useSongStudio() {
     setStatus("idle"); setProgress(0); setDuration(0);
   }
   function report(error: unknown) { if (mounted.current) setNotice(error instanceof Error ? error.message : "操作未完成，请重试。"); }
+  function refreshTakes() { void listTakes().then(list => { if (mounted.current) setTakes(list); }).catch(() => undefined); }
+  function refreshWorks() { void listWorks().then(list => { if (mounted.current) setWorks(list); }).catch(() => undefined); }
+  function follow(serial: number) {
+    const tick = () => { if (serial === task.current && mounted.current) { setProgress(player.current?.elapsed ?? 0); frame.current = requestAnimationFrame(tick); } }; tick();
+  }
   function clearProposal() { if (previewActive.current) stop(); proposalRef.current = null; setProposal(null); }
   function clearDownload() { if (downloadUrl.current) URL.revokeObjectURL(downloadUrl.current); downloadUrl.current = null; setDownload(null); }
   function commit(plan: SongPlan, sources = current.current.sources, origin: Snapshot["origin"] = "manual") {
@@ -84,7 +92,7 @@ export function useSongStudio() {
       read: readProject,
       propose,
     }, setBridge);
-    return () => { mounted.current = false; task.current++; abort.current?.abort(); player.current?.close(); cancelAnimationFrame(frame.current); disposeTools(); if (downloadUrl.current) URL.revokeObjectURL(downloadUrl.current); };
+    return () => { mounted.current = false; task.current++; abort.current?.abort(); player.current?.close(); cancelAnimationFrame(frame.current); disposeTools(); if (downloadUrl.current) URL.revokeObjectURL(downloadUrl.current); for (const url of workUrls.current.values()) URL.revokeObjectURL(url); workUrls.current.clear(); };
   }, []);
   useEffect(() => {
     let active = true; locked.current = true;
@@ -93,6 +101,7 @@ export function useSongStudio() {
       if (saved) { current.current = saved; setSnapshot(saved); }
       saveAllowed.current = true;
       setStorageNotice(saved ? "已恢复本机录音工程" : "录音工程会保存在本机浏览器");
+      refreshTakes(); refreshWorks();
     }).catch(() => {
       if (active) setStorageNotice("本机工程恢复失败；当前可继续创作，新录音前请确认已保留备份。");
     }).finally(() => { if (active) { locked.current = false; setHydrated(true); } });
@@ -106,11 +115,15 @@ export function useSongStudio() {
     return () => { active = false; };
   }, [snapshot, hydrated]);
   function recordingBusy(value: boolean) { if (value) stop(); recordingActive.current = value; locked.current = value; setRecording(value); }
-  function addSource(role: SoundRole, buffer: AudioBuffer, analysis: RecordingAnalysis, label = `我的${roleLabels[role]}声音`, example = false) {
+  function addSource(role: SoundRole, buffer: AudioBuffer, analysis: RecordingAnalysis, label = `我的${roleLabels[role]}声音`, example = false, recordHistory = true) {
     const source = { id: crypto.randomUUID(), role, label: label.slice(0, 60), buffer, analysis, example };
     const sources = [...current.current.sources.filter(item => item.role !== role), source];
     commit({ ...current.current.plan, patterns: { ...current.current.plan.patterns, [role]: analysis.steps } }, sources);
     setNotice(analysis.summary);
+    // 历史独立于当前工程：重录或载入示例覆盖当前声音后，旧的一条仍可从历史里取回。
+    // 从历史恢复不算新录音，否则同一条会在列表里重复堆积。
+    if (!recordHistory) return;
+    void addTake(source).then(refreshTakes).catch(() => { if (mounted.current) setStorageNotice("录音历史保存失败；当前工程仍会保存，重录前请先启用旧录音。"); });
   }
   function loadExamples() {
     if (locked.current) return;
@@ -135,6 +148,14 @@ export function useSongStudio() {
     finally { if (serial === task.current && mounted.current) { locked.current = false; setStatus("idle"); } }
   }
   function changeMood(mood: "warm" | "bright" | "dreamy") { if (!locked.current) { const plan = createSongPlan(mood); plan.patterns = structuredClone(current.current.plan.patterns); commit(plan, current.current.sources, "local"); } }
+  function changeHarmony(id: string) {
+    if (locked.current) return;
+    try {
+      const preset = harmonyPreset(id), plan = applyHarmony(current.current.plan, preset.id);
+      commit(plan, current.current.sources, "manual");
+      setNotice(`已换成「${preset.label}」和声；配器、段落和你的节奏保持不变，可以撤销。`);
+    } catch (error) { report(error); }
+  }
   function changePlan(plan: SongPlan) { if (!locked.current) { try { commit(plan); } catch (error) { report(error); } } }
   function adopt() {
     const next = proposalRef.current; if (!next || locked.current) return;
@@ -162,7 +183,7 @@ export function useSongStudio() {
       if (serial !== task.current || !mounted.current) return;
       audioPlayer.play(buffer, () => { if (serial === task.current && mounted.current) stop(); });
       setDuration(buffer.duration); setStatus(options.proposal ? "preview" : "playing");
-      const tick = () => { if (serial === task.current && mounted.current) { setProgress(audioPlayer.elapsed); frame.current = requestAnimationFrame(tick); } }; tick();
+      follow(serial);
     } catch (error) { if (serial === task.current && mounted.current) { stop(); report(error); } }
   }
   async function exportSong() {
@@ -177,10 +198,73 @@ export function useSongStudio() {
       if (downloadUrl.current) URL.revokeObjectURL(downloadUrl.current); downloadUrl.current = url;
       const name = `${state.plan.title.replace(/[^\p{L}\p{N}_-]/gu, "-")}-MelodyMate.wav`;
       setDownload({ url, name }); setNotice(`整曲已准备好（${buffer.duration.toFixed(1)} 秒），点击“保存 WAV”下载。`);
+      recordWork("song", bytes, buffer.duration);
     } catch (error) { if (serial === task.current) report(error); }
     finally { if (serial === task.current && mounted.current) { locked.current = false; setStatus("idle"); } }
   }
-  return { ...snapshot, proposal, status, notice, recording, bridge, lastCodex, progress, duration, download, storageNotice, canUndo: history.current.length > 0,
+  async function playTake(id: string) {
+    if (locked.current) return;
+    stop(); const serial = task.current;
+    player.current ??= new AudioPlayer(); const audioPlayer = player.current;
+    try {
+      const take = (await listTakes()).find(item => item.id === id);
+      if (!take) { report(new Error("这条录音已不在本机历史中。")); return; }
+      const unlock = audioPlayer.unlock(); setStatus("rendering"); await unlock;
+      if (serial !== task.current || !mounted.current) return;
+      const buffer = restoreTake(take).buffer;
+      audioPlayer.play(buffer, () => { if (serial === task.current && mounted.current) stop(); });
+      setDuration(buffer.duration); setStatus("playing"); follow(serial);
+    } catch (error) { if (serial === task.current && mounted.current) { stop(); report(error); } }
+  }
+  function applyTake(id: string) {
+    if (locked.current) return;
+    void listTakes().then(all => {
+      const take = all.find(item => item.id === id);
+      if (!take) { report(new Error("这条录音已不在本机历史中。")); return; }
+      const restored = restoreTake(take);
+      addSource(restored.role, restored.buffer, restored.analysis, restored.label, restored.example, false);
+      setNotice(`已把「${restored.label}」放回${roleLabels[restored.role]}位置，可以撤销。`);
+    }).catch(error => report(error));
+  }
+  function dropTake(id: string) { void removeTake(id).then(refreshTakes).catch(error => report(error)); }
+  function recordWork(kind: "song" | "mix" | "cloud", bytes: ArrayBuffer, seconds: number, id?: string) {
+    const suffix = kind === "song" ? "整曲" : kind === "mix" ? "原声融合版" : "云端生成";
+    void addWork({ kind, id, label: `${current.current.plan.title} ${suffix}`, seconds: Math.max(1, Math.round(seconds)), bytes: new Uint8Array(bytes) }).then(refreshWorks)
+      .catch(() => { if (mounted.current) setStorageNotice("作品保存失败；本次仍可直接下载保存。"); });
+  }
+  async function playWork(id: string) {
+    if (locked.current) return;
+    stop(); const serial = task.current;
+    player.current ??= new AudioPlayer(); const audioPlayer = player.current;
+    try {
+      const work = (await listWorks()).find(item => item.id === id);
+      if (!work) { report(new Error("这份作品已不在本机列表中。")); return; }
+      const unlock = audioPlayer.unlock(); setStatus("rendering"); await unlock;
+      if (serial !== task.current || !mounted.current) return;
+      const copy = work.bytes.buffer.slice(work.bytes.byteOffset, work.bytes.byteOffset + work.bytes.byteLength);
+      const buffer = await new OfflineAudioContext(1, 1, 44100).decodeAudioData(copy);
+      if (serial !== task.current || !mounted.current) return;
+      audioPlayer.play(buffer, () => { if (serial === task.current && mounted.current) stop(); });
+      setDuration(buffer.duration); setStatus("playing"); follow(serial);
+    } catch (error) { if (serial === task.current && mounted.current) { stop(); report(error); } }
+  }
+  function workUrl(id: string): string {
+    const cached = workUrls.current.get(id);
+    if (cached) return cached;
+    const work = works.find(item => item.id === id);
+    if (!work) return "";
+    const url = URL.createObjectURL(new Blob([work.bytes], { type: "audio/wav" }));
+    workUrls.current.set(id, url);
+    return url;
+  }
+  function dropWork(id: string) {
+    const url = workUrls.current.get(id);
+    if (url) { URL.revokeObjectURL(url); workUrls.current.delete(id); }
+    void removeWork(id).then(refreshWorks).catch(error => report(error));
+  }
+  return { ...snapshot, harmony: matchHarmony(snapshot.plan), proposal, status, notice, recording, bridge, lastCodex, progress, duration, download, storageNotice, canUndo: history.current.length > 0,
+    takes, works,
     projectText: JSON.stringify({ ...readProject(), proposalFormat: { baseRevision: "使用上面的revision", title: "简短标题（60字以内）", explanation: "具体变化说明（500字以内）", plan: "修改后的完整plan，须通过下面schema且总时长120～180秒、段落id唯一、首末含原声" }, planSchema: SONG_PLAN_SCHEMA }, null, 2), submitProposal,
-    busy: !hydrated || recording || ["loading", "exporting", "rendering"].includes(status), recordingBusy, addSource, loadExamples, loadFile, changeMood, changePlan, adopt, undo, play, stop, exportSong, report, clearProposal };
+    busy: !hydrated || recording || ["loading", "exporting", "rendering"].includes(status), recordingBusy, addSource, loadExamples, loadFile, changeMood, changeHarmony, changePlan, adopt, undo, play, stop, exportSong, report, clearProposal,
+    playTake, applyTake, dropTake, recordWork, playWork, dropWork, workUrl };
 }

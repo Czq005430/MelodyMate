@@ -7,7 +7,7 @@ import { renderBackingMix } from "../lib/backing-audio.ts";
 import { encodeWavChannels } from "../lib/wav.ts";
 import type { SongPlan, SongSource } from "../lib/song-types.ts";
 
-type Props = { backing: AudioBuffer; label: string; plan: SongPlan; sources: SongSource[]; revision: number; blocked: boolean; interrupted: boolean; onBeforePlay: () => void };
+type Props = { backing: AudioBuffer; label: string; plan: SongPlan; sources: SongSource[]; revision: number; blocked: boolean; interrupted: boolean; onBeforePlay: () => void; onWork?: (bytes: ArrayBuffer, seconds: number) => void };
 type Mode = "mix" | "source" | "backing";
 type Part = "start" | "middle" | "end" | "full";
 const clock = (seconds: number) => `${Math.floor(seconds / 60)}:${String(Math.floor(seconds % 60)).padStart(2, "0")}`;
@@ -46,6 +46,7 @@ export default function BackingMixer(props: Props) {
         clearDownload(); url.current = URL.createObjectURL(new Blob([bytes], { type: "audio/wav" }));
         setDownload({ url: url.current, name: `${props.plan.title.replace(/[^\p{L}\p{N}_-]/gu, "-")}-原声融合.wav` });
         setNotice(`已准备好 ${clock(buffer.duration)} 立体声 WAV。原声保留为真实录音切片，伴奏没有变速。`); setStatus("idle");
+        props.onWork?.(bytes, buffer.duration);
       } else {
         const length = part === "full" ? buffer.duration : Math.min(15, buffer.duration);
         const start = part === "middle" ? Math.max(0, (buffer.duration - length) / 2) : part === "end" ? buffer.duration - length : 0;

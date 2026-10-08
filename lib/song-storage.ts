@@ -96,12 +96,15 @@ export function restoreSongSnapshot(value: unknown, createBuffer: BufferFactory 
   }) };
 }
 
+const DATABASE_NAME = "MelodyMate-song-v1";
+const DATABASE_VERSION = 2;
+type StoreName = "snapshots" | "takes" | "works";
 function database(): Promise<IDBDatabase> {
   return new Promise((resolve, reject) => {
     if (typeof indexedDB === "undefined") { reject(new Error("当前浏览器不支持 IndexedDB 本地保存")); return; }
-    const request = indexedDB.open("MelodyMate-song-v1", 1);
+    const request = indexedDB.open(DATABASE_NAME, DATABASE_VERSION);
     let blocked = false;
-    request.onupgradeneeded = () => { if (!request.result.objectStoreNames.contains("snapshots")) request.result.createObjectStore("snapshots"); };
+    request.onupgradeneeded = () => { for (const name of ["snapshots", "takes", "works"] as StoreName[]) if (!request.result.objectStoreNames.contains(name)) request.result.createObjectStore(name); };
     request.onerror = () => reject(new Error("无法打开本地工程存储，请检查浏览器存储权限", { cause: request.error }));
     request.onblocked = () => { blocked = true; reject(new Error("本地工程存储被其他页面占用，请关闭其他工作台后重试")); };
     request.onsuccess = () => {
@@ -110,14 +113,14 @@ function database(): Promise<IDBDatabase> {
     };
   });
 }
-async function transact(mode: IDBTransactionMode, record?: SerializedSongSnapshot): Promise<unknown> {
+async function transact<T>(name: StoreName, mode: IDBTransactionMode, run: (store: IDBObjectStore) => IDBRequest): Promise<T> {
   const db = await database();
   try {
-    return await new Promise((resolve, reject) => {
-      const transaction = db.transaction("snapshots", mode), store = transaction.objectStore("snapshots");
-      const request = record ? store.put(record, "current") : store.get("current");
-      transaction.oncomplete = () => resolve(request.result);
-      transaction.onabort = () => reject(new Error("本地工程保存或读取失败，原有保存不会被部分覆盖", { cause: transaction.error }));
+    return await new Promise<T>((resolve, reject) => {
+      const transaction = db.transaction(name, mode);
+      const request = run(transaction.objectStore(name));
+      transaction.oncomplete = () => resolve(request.result as T);
+      transaction.onabort = () => reject(new Error("本地保存或读取失败，原有保存不会被部分覆盖", { cause: transaction.error }));
       transaction.onerror = () => { /* 默认行为会中止事务，由 onabort 报告最终失败。 */ };
     });
   } finally { db.close(); }
@@ -126,12 +129,93 @@ let saves: Promise<unknown> = Promise.resolve();
 export async function saveSongSnapshot(snapshot: StoredSongSnapshot): Promise<void> {
   // 在入队时复制，保证后续编辑不能改变等待写入的版本。
   const record = serializeSongSnapshot(snapshot);
-  const operation = saves.catch(() => undefined).then(() => transact("readwrite", record));
+  const operation = saves.catch(() => undefined).then(() => transact("snapshots", "readwrite", store => store.put(record, "current")));
   saves = operation;
   await operation;
 }
 export async function loadSongSnapshot(): Promise<StoredSongSnapshot | null> {
   await saves.catch(() => undefined);
-  const value = await transact("readonly");
+  const value = await transact<unknown>("snapshots", "readonly", store => store.get("current"));
   return value === undefined ? null : restoreSongSnapshot(value);
 }
+
+export type StoredTake = { id: string; role: SoundRole; label: string; example: boolean; recordedAt: number; sampleRate: number; channels: Float32Array[]; analysis: RecordingAnalysis };
+export type SongTake = Omit<StoredTake, "sampleRate" | "channels"> & { buffer: AudioBuffer };
+const MAX_TAKES = 12;
+// 同一毫秒内的多次写入必须仍能排出先后，否则"清理最旧"会删错条目。
+let takeStamp = 0;
+const nextStamp = (last: number) => Math.max(Date.now(), last + 1);
+function validateTakeRecord(value: unknown): StoredTake {
+  const record = object(value, ["id", "role", "label", "example", "recordedAt", "sampleRate", "channels", "analysis"]);
+  text(record.id, 128); text(record.label, 512);
+  if (!ROLES.includes(record.role as SoundRole) || typeof record.example !== "boolean") invalid("录音身份无效");
+  numeric(record.recordedAt, 0, Number.MAX_SAFE_INTEGER, true);
+  list(record.channels, 1, 2);
+  const first = record.channels[0];
+  if (!(first instanceof Float32Array)) invalid("PCM 必须为 Float32Array");
+  audioSize(record.sampleRate, first.length, record.channels.length);
+  for (const channel of record.channels as Float32Array[]) {
+    if (!(channel instanceof Float32Array) || channel.length !== first.length) invalid("PCM 声道长度不一致");
+    for (const sample of channel) if (!Number.isFinite(sample) || Math.abs(sample) > 16) invalid("PCM 包含无效幅度");
+  }
+  analysis(record.analysis, first.length / Number(record.sampleRate), Number(record.sampleRate));
+  return record as unknown as StoredTake;
+}
+export function restoreTake(value: unknown, createBuffer: BufferFactory = browserBuffer): SongTake {
+  const record = validateTakeRecord(value);
+  const buffer = createBuffer({ sampleRate: record.sampleRate, length: record.channels[0].length, numberOfChannels: record.channels.length });
+  record.channels.forEach((channel, index) => buffer.getChannelData(index).set(channel));
+  return { id: record.id, role: record.role, label: record.label, example: record.example, recordedAt: record.recordedAt, analysis: structuredClone(record.analysis), buffer };
+}
+export async function addTake(source: SongSource): Promise<void> {
+  audioSize(source.buffer.sampleRate, source.buffer.length, source.buffer.numberOfChannels);
+  const take: StoredTake = { id: source.id, role: source.role, label: source.label, example: source.example, recordedAt: takeStamp = nextStamp(takeStamp),
+    sampleRate: source.buffer.sampleRate, analysis: structuredClone(source.analysis),
+    channels: Array.from({ length: source.buffer.numberOfChannels }, (_, channel) => source.buffer.getChannelData(channel).slice()) };
+  validateTakeRecord(take);
+  await transact("takes", "readwrite", store => store.put(take, take.id));
+  const all = await transact<unknown[]>("takes", "readonly", store => store.getAll());
+  const valid: StoredTake[] = [], broken: string[] = [];
+  for (const item of all) { try { valid.push(validateTakeRecord(item)); } catch { broken.push((item as { id?: unknown }).id as string ?? ""); } }
+  const overflow = valid.sort((a, b) => b.recordedAt - a.recordedAt).slice(MAX_TAKES).map(item => item.id);
+  for (const id of [...broken, ...overflow]) if (id) await transact("takes", "readwrite", store => store.delete(id));
+}
+export async function listTakes(): Promise<StoredTake[]> {
+  const all = await transact<unknown[]>("takes", "readonly", store => store.getAll());
+  const takes: StoredTake[] = [];
+  // 单条历史损坏只跳过它自己，不能让用户失去其余录音。
+  for (const item of all) { try { takes.push(validateTakeRecord(item)); } catch { /* 跳过损坏条目 */ } }
+  return takes.sort((a, b) => b.recordedAt - a.recordedAt);
+}
+export async function removeTake(id: string): Promise<void> { await transact("takes", "readwrite", store => store.delete(id)); }
+
+export type StoredWork = { id: string; kind: "song" | "mix" | "cloud"; label: string; createdAt: number; seconds: number; bytes: Uint8Array<ArrayBuffer> };
+const MAX_WORKS = 6;
+let workStamp = 0;
+function validateWorkRecord(value: unknown): StoredWork {
+  const record = object(value, ["id", "kind", "label", "createdAt", "seconds", "bytes"]);
+  text(record.id, 128); text(record.label, 512);
+  if (!["song", "mix", "cloud"].includes(record.kind as string)) invalid("作品类型无效");
+  numeric(record.createdAt, 0, Number.MAX_SAFE_INTEGER, true);
+  numeric(record.seconds, 1, 3600);
+  if (!(record.bytes instanceof Uint8Array) || !record.bytes.length || record.bytes.length > 60 * 1024 * 1024) invalid("作品音频无效或过大");
+  return { ...(record as unknown as StoredWork), bytes: record.bytes as Uint8Array<ArrayBuffer> };
+}
+// id 可选：云端候选用固定 id 重复载入时覆盖同一条，不在作品列表里堆重复项。
+export async function addWork(work: { kind: "song" | "mix" | "cloud"; label: string; seconds: number; bytes: Uint8Array<ArrayBuffer>; id?: string }): Promise<StoredWork> {
+  const stored: StoredWork = { id: work.id ?? crypto.randomUUID(), createdAt: workStamp = nextStamp(workStamp), kind: work.kind, label: work.label.slice(0, 60), seconds: work.seconds, bytes: work.bytes };
+  validateWorkRecord(stored);
+  await transact("works", "readwrite", store => store.put(stored, stored.id));
+  const all = await transact<unknown[]>("works", "readonly", store => store.getAll());
+  const valid: StoredWork[] = [];
+  for (const item of all) { try { valid.push(validateWorkRecord(item)); } catch { /* 跳过损坏条目 */ } }
+  for (const extra of valid.sort((a, b) => b.createdAt - a.createdAt).slice(MAX_WORKS)) await transact("works", "readwrite", store => store.delete(extra.id));
+  return stored;
+}
+export async function listWorks(): Promise<StoredWork[]> {
+  const all = await transact<unknown[]>("works", "readonly", store => store.getAll());
+  const works: StoredWork[] = [];
+  for (const item of all) { try { works.push(validateWorkRecord(item)); } catch { /* 跳过损坏条目 */ } }
+  return works.sort((a, b) => b.createdAt - a.createdAt);
+}
+export async function removeWork(id: string): Promise<void> { await transact("works", "readwrite", store => store.delete(id)); }
