@@ -1,4 +1,3 @@
 import { musicHandlers } from "../../../../lib/music-handler.ts";
 export const runtime = "nodejs";
-export const POST = musicHandlers.create;
-export const GET = musicHandlers.list;
+export const POST = musicHandlers.extend;

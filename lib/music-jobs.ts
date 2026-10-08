@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { mkdir, readFile, rename, unlink, writeFile } from "node:fs/promises";
 import { join, resolve } from "node:path";
-import type { MusicJob, MusicJobRequest } from "./music-types.ts";
+import type { MusicJob, MusicJobRequest, MusicJobSummary } from "./music-types.ts";
 import { createMusicProvider, MusicAudioExpiredError, MusicProviderError, musicSettings } from "./music-provider.ts";
 import type { RemoteMusic } from "./music-provider.ts";
 import { RequestError } from "./request-guard.ts";
@@ -16,6 +16,7 @@ const storageError = () => new RequestError(503, "MUSIC_STORAGE", "本地音乐�
 const snapshotKey = (request: MusicJobRequest) => JSON.stringify({
   projectRevision: request.projectRevision, sourceIds: request.sourceIds,
   brief: { prompt: request.brief.prompt, bpm: request.brief.bpm, durationSec: request.brief.durationSec, sourceLabels: request.brief.sourceLabels },
+  clip: request.clip ? { url: request.clip.url, seconds: request.clip.seconds, continueAt: request.clip.continueAt } : null,
 });
 const publicJob = (record: StoredJob): MusicJob => structuredClone(record.job);
 
@@ -156,13 +157,13 @@ export function createMusicJobs({ env, fetch, clock = Date.now }: { env: ServerE
           throw new RequestError(429, "MUSIC_DAILY_LIMIT", "今日音乐提交预算已用完，明日（UTC）再试。");
         }
         const record: StoredJob = { fingerprint: snapshotKey(request), job: { ...request, id: randomUUID(), provider: "kie", createdAt: date,
-          status: "submitting", message: "已保留本次预算，正在提交音乐任务。", candidates: [] } };
+          status: "submitting", message: request.clip ? "已保留本次预算，正在上传素材并提交续写任务。" : "已保留本次预算，正在提交音乐任务。", candidates: [] } };
         records.push(record); await save(); return { record, submit: true };
       });
       if (!reserved.submit) return publicJob(reserved.record);
       const record = reserved.record;
       try {
-        const taskId = await provider.create(request.brief);
+        const taskId = record.job.clip ? await provider.createExtend(record.job.clip, request.brief) : await provider.create(request.brief);
         await locked(async () => { record.taskId = taskId; record.job.status = "pending"; record.job.message = "音乐任务已提交，等待生成。"; await save(); });
       } catch (error) {
         if (error instanceof RequestError) throw error;
@@ -179,6 +180,12 @@ export function createMusicJobs({ env, fetch, clock = Date.now }: { env: ServerE
       const current = polling.get(id); if (current) return current;
       const pending = poll(id).finally(() => polling.delete(id)); polling.set(id, pending); return pending;
     },
+    // 浏览器存储按标签页和地址隔离，任务台账只在服务端；列表是跨标签页找回结果的唯一入口。
+    list(): Promise<MusicJobSummary[]> {
+      return locked(async () => [...records].sort((left, right) => right.job.createdAt.localeCompare(left.job.createdAt)).slice(0, 8)
+        .map(record => ({ id: record.job.id, status: record.job.status, createdAt: record.job.createdAt,
+          continued: !!record.job.clip, candidates: record.job.candidates.length, prompt: record.job.brief.prompt })));
+    },
     async audio(id: string, index: number): Promise<{ bytes: Uint8Array; contentType: string }> {
       const type = await locked(async () => {
         const record = find(id);
@@ -187,6 +194,11 @@ export function createMusicJobs({ env, fetch, clock = Date.now }: { env: ServerE
       });
       try { return { bytes: new Uint8Array(await readFile(join(dir, `${id}-${index}.audio`))), contentType: type }; }
       catch { throw missing(); }
+    },
+    // 素材只转交给服务商的上传通道，本机不保存原始音频；未配置时绝不发起上传。
+    async upload(bytes: Uint8Array): Promise<string> {
+      if (!musicSettings(env).valid) throw new RequestError(503, "MUSIC_NOT_CONFIGURED", "音乐服务尚未正确配置，当前不会上传素材。");
+      return provider.uploadClip(bytes);
     },
   };
 }

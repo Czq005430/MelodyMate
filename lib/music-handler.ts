@@ -1,8 +1,8 @@
 import { createHash, timingSafeEqual } from "node:crypto";
 import type { MusicConfig, MusicJobRequest } from "./music-types.ts";
 import { createMusicJobs } from "./music-jobs.ts";
-import { musicSettings } from "./music-provider.ts";
-import { readJsonBody, RequestError } from "./request-guard.ts";
+import { musicSettings, validateClip, MusicProviderError } from "./music-provider.ts";
+import { originMatches, readBinaryBody, readJsonBody, RequestError } from "./request-guard.ts";
 import type { ServerEnv } from "./request-guard.ts";
 
 const invalid = () => new RequestError(400, "INVALID_MUSIC_REQUEST", "音乐描述或工程信息不符合要求，请重新选择后再试。");
@@ -17,8 +17,9 @@ function strings(value: unknown, maximum: number): string[] {
   if (!Array.isArray(value) || value.length > 3 || value.some((item) => typeof item !== "string" || !item.trim() || [...item].length > maximum)) throw invalid();
   return value as string[];
 }
-export function validateMusicRequest(value: unknown): MusicJobRequest {
-  const request = obj(value); keys(request, ["requestId", "projectRevision", "sourceIds", "brief"]);
+function readRequest(value: unknown, withClip: boolean): MusicJobRequest {
+  const request = obj(value);
+  keys(request, withClip ? ["requestId", "projectRevision", "sourceIds", "brief", "clip"] : ["requestId", "projectRevision", "sourceIds", "brief"]);
   const brief = obj(request.brief); keys(brief, ["prompt", "bpm", "durationSec", "sourceLabels"]);
   if (typeof request.requestId !== "string" || !/^[\da-f]{8}-[\da-f]{4}-[\da-f]{4}-[\da-f]{4}-[\da-f]{12}$/i.test(request.requestId)
     || !Number.isSafeInteger(request.projectRevision) || (request.projectRevision as number) < 0
@@ -27,8 +28,22 @@ export function validateMusicRequest(value: unknown): MusicJobRequest {
     || ![120, 150, 180].includes(brief.durationSec as number)) throw invalid();
   const sourceIds = strings(request.sourceIds, 120); const sourceLabels = strings(brief.sourceLabels, 60);
   if (new Set(sourceIds).size !== sourceIds.length || sourceIds.length !== sourceLabels.length) throw invalid();
-  return { requestId: request.requestId, projectRevision: request.projectRevision as number, sourceIds,
+  const base = { requestId: request.requestId, projectRevision: request.projectRevision as number, sourceIds,
     brief: { prompt: brief.prompt, bpm: brief.bpm, durationSec: brief.durationSec as 120 | 150 | 180, sourceLabels } };
+  // 续写任务的 clip 校验失败要给出具体原因，不能笼统报"描述不符合要求"。
+  if (!withClip) return base;
+  try { return { ...base, clip: validateClip(request.clip) }; }
+  catch (error) { throw error instanceof MusicProviderError ? new RequestError(400, "INVALID_MUSIC_CLIP", error.message) : error; }
+}
+export function validateMusicRequest(value: unknown): MusicJobRequest { return readRequest(value, false); }
+export function validateExtendRequest(value: unknown): MusicJobRequest { return readRequest(value, true); }
+
+const MAX_CLIP_BYTES = 20 * 1024 * 1024;
+const clipTypes = ["audio/wav", "audio/x-wav", "audio/mpeg", "audio/mp3"];
+function looksLikeAudio(bytes: Uint8Array): boolean {
+  const head = new TextDecoder().decode(bytes.subarray(0, 12));
+  const frame = bytes[0] === 0xff && (bytes[1] & 0xe0) === 0xe0;
+  return (head.startsWith("RIFF") && head.slice(8) === "WAVE") || head.startsWith("ID3") || frame;
 }
 
 function accessConfigured(env: ServerEnv): boolean {
@@ -38,11 +53,14 @@ function accessConfigured(env: ServerEnv): boolean {
 function guard(request: Request, env: ServerEnv) {
   if (!accessConfigured(env)) throw new RequestError(503, "MUSIC_ACCESS_NOT_CONFIGURED", "音乐服务尚未开放，请先配置服务端访问口令。");
   const origin = request.headers.get("origin"); const site = request.headers.get("sec-fetch-site");
-  const sameOrigin = origin === env.APP_ORIGIN || (request.method === "GET" && origin === null && site === "same-origin" && new URL(request.url).origin === env.APP_ORIGIN);
+  const sameOrigin = originMatches(origin, env.APP_ORIGIN) || (request.method === "GET" && origin === null && site === "same-origin" && originMatches(new URL(request.url).origin, env.APP_ORIGIN));
   const digest = (value: string) => createHash("sha256").update(value).digest();
-  if (!sameOrigin || (site !== null && site !== "same-origin")
-    || !timingSafeEqual(digest(request.headers.get("x-demo-token") ?? ""), digest(env.DEMO_ACCESS_TOKEN!))) {
-    throw new RequestError(403, "MUSIC_ACCESS_DENIED", "无法验证请求来源或演示口令。");
+  // 来源与口令分开报错：笼统的一句"无法验证"会让使用者无从下手。
+  if (!sameOrigin || (site !== null && site !== "same-origin")) {
+    throw new RequestError(403, "MUSIC_ACCESS_DENIED", `地址栏与服务端 APP_ORIGIN 不一致（期望 ${env.APP_ORIGIN}；localhost、127.0.0.1、::1 已视为等价）。请检查协议和端口是否一致。`);
+  }
+  if (!timingSafeEqual(digest(request.headers.get("x-demo-token") ?? ""), digest(env.DEMO_ACCESS_TOKEN!))) {
+    throw new RequestError(403, "MUSIC_ACCESS_DENIED", "演示口令不正确。请粘贴 .env.local 中 DEMO_ACCESS_TOKEN 等号后面的完整值（12 位左右），不要带引号或空格，也不要填成 MUSIC_API_KEY。");
   }
 }
 const headers = { "cache-control": "no-store", "x-content-type-options": "nosniff" };
@@ -61,14 +79,29 @@ export function createMusicHandlers({ env, fetch, clock }: { env: ServerEnv; fet
     async config(_request: Request): Promise<Response> {
       const settings = musicSettings(env); const configured = settings.valid && accessConfigured(env);
       const value: MusicConfig = { configured, provider: "kie", maxJobsPerDay: Number.isSafeInteger(settings.maxJobsPerDay) && settings.maxJobsPerDay > 0 ? settings.maxJobsPerDay : 12,
-        message: configured ? "Kie 音乐服务已配置；仅发送文字描述，真实生成效果仍需联调验证。" : "音乐服务尚未配置，当前不会调用生成或产生费用。" };
+        message: configured ? "Kie 音乐服务已配置；生成伴奏只发送文字，续写会上传你导出的雏形片段。真实效果仍需联调验证。" : "音乐服务尚未配置，当前不会调用生成或产生费用。" };
       return json(value);
     },
     create(request: Request): Promise<Response> {
       return respond(async () => { guard(request, env); const body = validateMusicRequest(await readJsonBody(request)); return json(await jobs.create(body), 202); });
     },
+    extend(request: Request): Promise<Response> {
+      return respond(async () => { guard(request, env); const body = validateExtendRequest(await readJsonBody(request)); return json(await jobs.create(body), 202); });
+    },
+    upload(request: Request): Promise<Response> {
+      return respond(async () => {
+        guard(request, env);
+        const bytes = await readBinaryBody(request, MAX_CLIP_BYTES, clipTypes);
+        if (!looksLikeAudio(bytes)) throw new RequestError(400, "INVALID_CLIP", "素材不是可识别的 WAV 或 MP3 文件，未上传。");
+        try { return json({ url: await jobs.upload(bytes) }); }
+        catch (error) { if (error instanceof MusicProviderError) throw new RequestError(502, "MUSIC_CLIP_UPLOAD_FAILED", error.message); throw error; }
+      });
+    },
     get(request: Request, id: string): Promise<Response> {
       return respond(async () => { guard(request, env); return json(await jobs.get(id)); });
+    },
+    list(request: Request): Promise<Response> {
+      return respond(async () => { guard(request, env); return json({ jobs: await jobs.list() }); });
     },
     audio(request: Request, id: string, index: string): Promise<Response> {
       return respond(async () => {

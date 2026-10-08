@@ -26,6 +26,8 @@ test("access guard fails closed without configuration or with missing/wrong orig
     assert.throws(() => createRequestGuard({ env: accessEnv }).check(missing), hasStatus(403));
     assert.throws(() => createRequestGuard({ env: accessEnv }).check(request("{}", { [header]: "wrong" })), hasStatus(403));
   }
+  assert.doesNotThrow(() => createRequestGuard({ env: accessEnv }).check(request("{}", { origin: "http://127.0.0.1:3000" })));
+  assert.throws(() => createRequestGuard({ env: accessEnv }).check(request("{}", { origin: "http://127.0.0.1:3001" })), hasStatus(403));
 });
 
 test("untrusted proxy headers cannot bypass the shared 10 per minute limit", () => {

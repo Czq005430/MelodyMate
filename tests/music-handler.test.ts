@@ -45,6 +45,45 @@ test("create rejects missing origin, wrong token, malformed and oversized bodies
   assert.equal(calls, 0);
 });
 
+test("403 分别说明地址不一致与口令不正确，便于用户自查", async (t) => {
+  const handlers = createMusicHandlers({ env: { ...env, MUSIC_DATA_DIR: await setup(t) } });
+  const denied = async (headers: Record<string, string>) => (await (await handlers.create(request(body(), headers))).json()).error;
+  const wrongHost = await denied({ origin: "http://192.168.1.20:3000" });
+  assert.equal(wrongHost.code, "MUSIC_ACCESS_DENIED");
+  assert.match(wrongHost.message, /APP_ORIGIN 不一致/); assert.match(wrongHost.message, /127\.0\.0\.1:3000/);
+  const wrongToken = await denied({ "x-demo-token": "wrong" });
+  assert.equal(wrongToken.code, "MUSIC_ACCESS_DENIED");
+  assert.match(wrongToken.message, /演示口令不正确/); assert.match(wrongToken.message, /DEMO_ACCESS_TOKEN/);
+  assert.doesNotMatch(`${wrongHost.message}${wrongToken.message}`, /private-key|test-demo/);
+});
+
+test("回环地址互为等价来源，localhost 打开的页面不再被 403", async (t) => {
+  const fetcher = async () => Response.json({ code: 200, data: { taskId: "upstream-private-id" } });
+  for (const host of ["localhost", "127.0.0.1", "[::1]"]) {
+    const handlers = createMusicHandlers({ env: { ...env, MUSIC_DATA_DIR: await setup(t) }, fetch: fetcher });
+    assert.equal((await handlers.create(request(body(), { origin: `http://${host}:3000` }))).status, 202);
+  }
+  const blocked = createMusicHandlers({ env: { ...env, MUSIC_DATA_DIR: await setup(t) }, fetch: fetcher });
+  assert.equal((await blocked.create(request(body(), { origin: "http://127.0.0.1:3001" }))).status, 403);
+  assert.equal((await blocked.create(request(body(), { origin: "https://127.0.0.1:3000" }))).status, 403);
+});
+
+test("jobs 列表需要口令，返回最近任务摘要且不含敏感信息", async (t) => {
+  const dir = await setup(t);
+  const fetcher = async () => Response.json({ code: 200, data: { taskId: "upstream-private-id" } });
+  const handlers = createMusicHandlers({ env: { ...env, MUSIC_DATA_DIR: dir }, fetch: fetcher });
+  const bare = new Request(`${origin}/api/music/jobs`, { headers: { origin } });
+  assert.equal((await handlers.list(bare)).status, 403);
+  const listed = new Request(`${origin}/api/music/jobs`, { headers: { origin, "x-demo-token": "test-demo", "sec-fetch-site": "same-origin" } });
+  assert.deepEqual((await (await handlers.list(listed)).json()).jobs, []);
+  assert.equal((await handlers.create(request(body()))).status, 202);
+  const after = (await (await handlers.list(listed)).json()).jobs;
+  assert.equal(after.length, 1);
+  assert.equal(after[0].continued, false); assert.equal(after[0].candidates, 0);
+  assert.match(after[0].prompt, /轻柔钢琴/);
+  assert.doesNotMatch(JSON.stringify(after), /private-key|test-demo|upstream-private-id/);
+});
+
 test("GET without Origin requires same-origin Fetch Metadata plus matching request URL and token", async (t) => {
   const handlers = createMusicHandlers({ env: { ...env, MUSIC_DATA_DIR: await setup(t) } });
   const id = randomUUID();
@@ -88,4 +127,61 @@ test("a generated audio file is served only through the authenticated local cand
   assert.equal(response.status, 200); assert.equal(response.headers.get("content-type"), "audio/mpeg");
   assert.equal(response.headers.get("cache-control"), "no-store");
   assert.deepEqual(new Uint8Array(await response.arrayBuffer()), audio);
+});
+
+const clip = { url: "https://tempfile.redpandaai.co/kie-ai/melodymate/clip.wav", seconds: 120, continueAt: 30 };
+const extendBody = (over: Record<string, unknown> = {}) => ({ ...body(), clip: { ...clip, ...over } });
+
+test("extend 拒绝起点超出素材时长、外部域名、缺字段与多余字段，且一次都不调用服务商", async (t) => {
+  let calls = 0;
+  const handlers = createMusicHandlers({ env: { ...env, MUSIC_DATA_DIR: await setup(t) }, fetch: async () => { calls++; throw new Error("unexpected"); } });
+  const post = (value: unknown) => handlers.extend(request(value));
+  assert.equal((await post({ ...body() })).status, 400);
+  assert.equal((await post(extendBody({ seconds: 9.6, continueAt: 6 }))).status, 400);
+  assert.equal((await post(extendBody({ seconds: 120, continueAt: 200 }))).status, 400);
+  assert.equal((await post(extendBody({ seconds: 120, continueAt: 120 }))).status, 400);
+  assert.equal((await post(extendBody({ seconds: 120, continueAt: 0 }))).status, 400);
+  assert.match(((await (await post(extendBody({ seconds: 120, continueAt: 200 }))).json()).error).message, /续写起点/);
+  assert.equal((await post(extendBody({ url: "https://evil.example/a.wav" }))).status, 400);
+  assert.equal((await post(extendBody({ url: "http://tempfile.redpandaai.co/a.wav" }))).status, 400);
+  assert.equal((await post(extendBody({ seconds: 600 }))).status, 400);
+  const noToken = request(extendBody()); noToken.headers.delete("x-demo-token");
+  assert.equal((await handlers.extend(noToken)).status, 403);
+  assert.equal((await post({ ...extendBody(), clip: { ...clip, extra: 1 } })).status, 400);
+  assert.equal((await post({ ...extendBody(), rawAudio: "forbidden" })).status, 400);
+  assert.equal(calls, 0);
+});
+
+test("extend 提交素材地址与续写起点，不提交时长；换起点即视为另一份请求", async (t) => {
+  const sent: string[] = [];
+  const handlers = createMusicHandlers({ env: { ...env, MUSIC_DATA_DIR: await setup(t) }, fetch: async (url, init) => {
+    sent.push(`${url}|${(init as { body?: string } | undefined)?.body ?? ""}`);
+    return Response.json({ code: 200, data: { taskId: "upstream-task" } });
+  } });
+  const snapshot = extendBody();
+  const created = await (await handlers.extend(request(snapshot))).json();
+  assert.equal(created.status, "pending");
+  assert.equal(created.clip.continueAt, 30);
+  assert.match(sent[0], /upload-and-extend-audio/);
+  assert.match(sent[0], /continue_at/);
+  assert.match(sent[0], /upload_url/);
+  assert.doesNotMatch(sent[0], /"duration"/);
+  assert.doesNotMatch(JSON.stringify(created), /private-key|upstream-task/);
+  assert.equal((await handlers.extend(request({ ...snapshot, clip: { ...clip, continueAt: 45 } }))).status, 409);
+  assert.equal(sent.length, 1);
+});
+
+test("uploads 要求口令、音频类型与真实音频字节，未配置时绝不上传", async (t) => {
+  let calls = 0;
+  const handlers = createMusicHandlers({ env: { ...env, MUSIC_DATA_DIR: await setup(t) }, fetch: async () => { calls++; throw new Error("unexpected"); } });
+  const text = new TextEncoder();
+  const wav = new Uint8Array([...text.encode("RIFF"), 44, 0, 0, 0, ...text.encode("WAVEfmt ")]);
+  const upload = (bodyInit: BodyInit, type: string) => handlers.upload(new Request(`${origin}/api/music/uploads`, {
+    method: "POST", headers: { origin, "x-demo-token": "test-demo", "content-type": type }, body: bodyInit,
+  }));
+  assert.equal((await handlers.upload(new Request(`${origin}/api/music/uploads`, { method: "POST", body: wav }))).status, 403);
+  assert.equal((await upload(wav, "text/plain")).status, 415);
+  assert.equal((await upload(new Uint8Array([1, 2, 3, 4]), "audio/wav")).status, 400);
+  assert.equal((await upload(new Uint8Array([]), "audio/wav")).status, 400);
+  assert.equal(calls, 0);
 });

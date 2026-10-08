@@ -1,4 +1,4 @@
-import type { MusicBrief } from "./music-types.ts";
+import type { MusicBrief, MusicClip } from "./music-types.ts";
 import type { ServerEnv } from "./request-guard.ts";
 
 export type RemoteMusic = { id: string; title: string; url: string; durationSec: number | null };
@@ -11,6 +11,9 @@ export class MusicAudioExpiredError extends MusicProviderError {
   constructor() { super("音频下载地址已失效或无法访问。"); }
 }
 const hosts = new Set(["file.aiquickdraw.com", "tempfile.aiquickdraw.com", "cdn1.suno.ai", "cdn2.suno.ai"]);
+// 素材上传走 Kie 的另一套服务，域名与音乐接口不同；上传直链只允许回给音乐接口，不从本机下载。
+const fileApi = "https://kieai.redpandaai.co";
+const uploadHosts = new Set(["tempfile.redpandaai.co", "file.redpandaai.co", "tempfileb.aiquickdraw.com", "tempfile.aiquickdraw.com"]);
 const models = new Set(["V6", "V6_MINI", "V6_WILD"]);
 const rejected = new Set([400, 401, 402, 403, 404, 422, 429]);
 const protocol = () => new MusicProviderError("音乐服务返回的协议不匹配，请核对服务商文档。");
@@ -33,13 +36,20 @@ function audioUrl(value: unknown): string {
 }
 
 // Only these explicit response shapes are accepted; cover/image URLs are never recursively collected.
+// resultObject.data[] 带 duration 与来源字段，优先于只有地址字符串的 resultUrls。
 export function parseMusicResult(raw: unknown): RemoteMusic[] {
   let value: unknown;
   try { value = typeof raw === "string" ? JSON.parse(raw) : raw; } catch { throw protocol(); }
   const result = object(value);
   const nested = object(result?.data);
-  const list = Array.isArray(value) ? value : result?.resultUrls ?? result?.tracks ?? nested?.data ?? result?.data;
-  if (!Array.isArray(list) || list.length < 1 || list.length > 4) throw protocol();
+  const inner = object(result?.resultObject);
+  const list = (Array.isArray(inner?.data) ? inner.data : undefined)
+    ?? (Array.isArray(value) ? value : undefined)
+    ?? (Array.isArray(result?.resultUrls) ? result.resultUrls : undefined)
+    ?? (Array.isArray(result?.tracks) ? result.tracks : undefined)
+    ?? (Array.isArray(nested?.data) ? nested.data : undefined)
+    ?? (Array.isArray(result?.data) ? result.data : undefined);
+  if (!list || list.length < 1 || list.length > 4) throw protocol();
   return list.map((entry, index) => {
     const track = object(entry);
     const url = audioUrl(typeof entry === "string" ? entry : track?.audio_url ?? track?.audioUrl);
@@ -50,6 +60,29 @@ export function parseMusicResult(raw: unknown): RemoteMusic[] {
       url, durationSec: typeof duration === "number" && Number.isFinite(duration) && duration > 0 && duration <= 3600 ? duration : null,
     };
   });
+}
+
+// 素材直链只允许交给音乐接口，本机不下载；域名与生成结果白名单分开维护。
+export function clipUrl(value: unknown): string {
+  if (typeof value !== "string" || value.length > 4096) throw protocol();
+  let url: URL;
+  try { url = new URL(value); } catch { throw protocol(); }
+  if (url.protocol !== "https:" || !uploadHosts.has(url.hostname) || url.username || url.password || url.port || url.hash) {
+    throw new MusicProviderError("素材地址不在允许的上传服务范围，未提交续写。");
+  }
+  return url.href;
+}
+
+// continue_at 必须落在素材时长之内：超出时上游不一定报错，但结果语义未定义（实测 60 秒起点配 9.6 秒素材仍"成功"）。
+export function validateClip(value: unknown): MusicClip {
+  const clip = object(value);
+  if (!clip || Object.keys(clip).join(",") !== "url,seconds,continueAt") throw new MusicProviderError("续写素材信息不完整，请重新导出雏形。");
+  const { seconds, continueAt } = clip;
+  if (typeof seconds !== "number" || !Number.isFinite(seconds) || seconds < 10 || seconds > 480) throw new MusicProviderError("续写素材须在 10～480 秒之间。");
+  if (typeof continueAt !== "number" || !Number.isFinite(continueAt) || continueAt <= 0 || continueAt >= seconds) {
+    throw new MusicProviderError("续写起点必须落在素材时长之内，否则模型行为不可预期。");
+  }
+  return { url: clipUrl(clip.url), seconds, continueAt };
 }
 
 async function readBytes(response: Response, maximum: number): Promise<Uint8Array> {
@@ -121,6 +154,38 @@ export function createMusicProvider({ env, fetch: fetcher = globalThis.fetch }: 
       } });
       if (typeof data.taskId !== "string" || !data.taskId || data.taskId.length > 200) throw new MusicProviderError("提交结果缺少任务编号，请勿重复生成。", true);
       return data.taskId;
+    },
+    async createExtend(clip: MusicClip, brief: MusicBrief): Promise<string> {
+      const style = `纯器乐续写，无人声、无歌词。稳定 ${brief.bpm} BPM，前段是用户的真实生活敲击声，请保留它的音色与节奏感继续发展。${brief.prompt}`;
+      if ([...style].length > 1000) throw new MusicProviderError("续写描述超过服务商长度限制。");
+      const data = await api("createTask", { model: "ai-music-api/upload-and-extend-audio", input: {
+        upload_url: clip.url, instrumental: true, model: musicSettings(env).model,
+        continue_at: clip.continueAt, style, title: "MelodyMate 雏形续写",
+        negative_tags: "vocals, lyrics, humming, sudden tempo change, key change",
+      } });
+      if (typeof data.taskId !== "string" || !data.taskId || data.taskId.length > 200) throw new MusicProviderError("提交结果缺少任务编号，请勿重复生成。", true);
+      return data.taskId;
+    },
+    async uploadClip(bytes: Uint8Array): Promise<string> {
+      if (!musicSettings(env).valid) throw new MusicProviderError("音乐服务尚未正确配置。");
+      const form = new FormData();
+      form.append("file", new Blob([bytes as BlobPart], { type: "audio/wav" }), "melodymate-clip.wav");
+      form.append("uploadPath", "melodymate");
+      const controller = new AbortController(); const timer = setTimeout(() => controller.abort(), 45_000);
+      try {
+        const response = await fetcher(`${fileApi}/api/file-stream-upload`, { method: "POST", redirect: "error", signal: controller.signal,
+          headers: { authorization: `Bearer ${env.MUSIC_API_KEY}` }, body: form });
+        let parsed: unknown;
+        try { parsed = JSON.parse(await response.text()); } catch { throw new MusicProviderError("素材上传结果无法确认，请先在服务商后台核对，不要重复上传。", true); }
+        const result = object(parsed);
+        if (!result || typeof result.code !== "number") throw protocol();
+        const data = object(result.data);
+        if (result.code !== 200 || typeof data?.downloadUrl !== "string") throw new MusicProviderError("素材上传被拒绝，未提交续写。", !rejected.has(result.code));
+        return clipUrl(data.downloadUrl);
+      } catch (error) {
+        if (error instanceof MusicProviderError) throw error;
+        throw new MusicProviderError("素材上传结果无法确认，请检查本机网络后重试，不要重复上传。", true);
+      } finally { clearTimeout(timer); controller.abort(); }
     },
     async query(taskId: string): Promise<MusicQuery> {
       const data = await api(`recordInfo?taskId=${encodeURIComponent(taskId)}`);

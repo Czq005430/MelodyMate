@@ -25,3 +25,15 @@ export function saveMusicSession(session: MusicSession, storage?: SessionStorage
 export function sameMusicProject(request: MusicJobRequest, revision: number, sourceIds: string[]): boolean {
   return request.projectRevision === revision && request.sourceIds.length === sourceIds.length && request.sourceIds.every(id => sourceIds.includes(id));
 }
+
+// 口令只存 sessionStorage：同一标签页不必重填，关掉标签页即清除，不像 localStorage 那样长期留在磁盘。
+const TOKEN_KEY = "melodymate.demo-token.v1";
+export function readDemoToken(storage?: SessionStorage): string {
+  try { return (storage ?? globalThis.sessionStorage).getItem(TOKEN_KEY) ?? ""; } catch { return ""; }
+}
+export function saveDemoToken(token: string, storage?: SessionStorage): void {
+  try {
+    const store = storage ?? globalThis.sessionStorage;
+    if (token) store.setItem(TOKEN_KEY, token); else store.removeItem(TOKEN_KEY);
+  } catch { /* 存不下时口令只留在内存，本次提交仍然可用，不打断用户。 */ }
+}

@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { readMusicSession, saveMusicSession, sameMusicProject } from "../lib/music-session.ts";
+import { readDemoToken, readMusicSession, saveDemoToken, saveMusicSession, sameMusicProject } from "../lib/music-session.ts";
 import type { MusicJobRequest } from "../lib/music-types.ts";
 
 const request: MusicJobRequest = { requestId: "3e80acb4-fca1-4c7a-bcc5-214294a3e063", projectRevision: 2, sourceIds: ["cup"], brief: { prompt: "温暖的钢琴", bpm: 96, durationSec: 150, sourceLabels: ["杯子"] } };
@@ -41,4 +41,27 @@ test("旧版本或替换了原声的候选不被当作当前工程", () => {
   assert.equal(sameMusicProject(request, 3, ["cup"]), false);
   assert.equal(sameMusicProject(request, 2, ["wood"]), false);
   assert.equal(sameMusicProject(request, 2, ["cup", "wood"]), false);
+});
+test("演示口令按标签页保存，可恢复，清空后不留残值，也不会被当成任务记录", () => {
+  const values = new Map<string, string>();
+  const store = { getItem: (key: string) => values.get(key) ?? null, setItem: (key: string, value: string) => { values.set(key, value); }, removeItem: (key: string) => { values.delete(key); } };
+  assert.equal(readDemoToken(store), "");
+  saveDemoToken("local-demo", store);
+  assert.equal(readDemoToken(store), "local-demo");
+  assert.equal(readMusicSession(store), null);
+  saveDemoToken("", store);
+  assert.equal(readDemoToken(store), "");
+  assert.equal(values.size, 0);
+});
+test("浏览器禁止访问 sessionStorage 时口令读取为空，保存不抛错", () => {
+  const previous = Object.getOwnPropertyDescriptor(globalThis, "sessionStorage");
+  Object.defineProperty(globalThis, "sessionStorage", { configurable: true, get() { throw new Error("SecurityError"); } });
+  try {
+    assert.equal(readDemoToken(), "");
+    saveDemoToken("local-demo");
+    assert.equal(readDemoToken(), "");
+  } finally {
+    if (previous) Object.defineProperty(globalThis, "sessionStorage", previous);
+    else Reflect.deleteProperty(globalThis, "sessionStorage");
+  }
 });
