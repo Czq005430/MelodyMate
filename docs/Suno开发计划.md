@@ -75,3 +75,14 @@ type MusicCandidate = { id: string; title: string; durationSec: number | null; a
 - [ ] 取得 Key 后验证真实接口返回、费用、成曲时长与人工听感，详见开通指南的待办。此项不作为无 Key 开发已完成的能力。
 
 真实账号到位后的六次试听实验仍是上线主流程的依据：比较纯文字整曲、原声参考改编、独立伴奏的完整听感与原声辨识度。第一期只实现其中独立伴奏路线的产品接入。
+
+## 五、雏形续写接入（2026-10-08 增补）
+
+上一节"只发送文字、不发送原声"仍适用于**生成独立伴奏**。同日新增第二种用法，不改动上一节的验收结论。
+
+- 新增 `POST /api/music/uploads`：接收浏览器渲染的单声道 WAV（上限 20 MiB，校验 MIME 与 RIFF/ID3/帧同步魔数），由服务端转传 `kieai.redpandaai.co/api/file-stream-upload`，只回传素材直链。API Key 始终不下发浏览器，未配置时绝不发起上传。
+- 新增 `POST /api/music/extend`：请求带 `clip: { url, seconds, continueAt }`，走 `ai-music-api/upload-and-extend-audio`。`continue_at` 必须落在素材时长之内——实测起点 60 秒配 9.6 秒素材仍返回"成功"，所以这条改由服务端拒绝，不把未定义行为交给上游。
+- 素材直链域名与结果下载域名分开维护白名单；`MusicJobRequest` 增加可选 `clip`，任务指纹与幂等键包含它；续写产物由 `musicRoute()` 从 `clip` 是否存在派生，标记为"已含原声"，前端不再叠加原声轨，也不进入节拍校准与融合导出。
+- 结果解析改为优先读取 `resultObject.data[]`，否则拿不到 `duration`；保留原 `resultUrls` 兜底。
+- `SongPlan`、`validateSongPlan`、WebMCP 工具与 Codex 提案契约均未改动。
+- 仍未验证：真实续写听感；续写成品前段是否逐样本保留（接口不提供可核对的来源字段）；`instrumental: true` 与非空 `style` 共存时上游是否一律接受。本机合同测试使用模拟上游，不能当作服务商已接受。
