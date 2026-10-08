@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { createSongPlan, expandSong, sectionTimings, SONG_PLAN_SCHEMA, songDuration, validateSongPlan } from "../lib/song-plan.ts";
+import { applyHarmony, createSongPlan, expandSong, HARMONY_PRESETS, harmonyPreset, matchHarmony, sectionTimings, SONG_PLAN_SCHEMA, songDuration, validateSongPlan } from "../lib/song-plan.ts";
 import type { SongPlan, SoundRole } from "../lib/song-types.ts";
 
 function fixture(): SongPlan {
@@ -139,5 +139,64 @@ test("所有调性和七级和弦均有合法声部，最高密度乐谱的事�
     assert.ok(events.samples.length + events.notes.length < 20000);
     assert.ok(events.samples.every(event => event.time < 180 && event.velocity > 0 && event.velocity <= 1));
     assert.ok(events.notes.every(note => Number.isInteger(note.midi) && note.midi >= 24 && note.midi <= 96 && note.time + note.duration <= 180));
+  }
+});
+
+test("八套和声预设都能用于三种初稿，且只替换和弦不碰其他编曲字段", () => {
+  for (const mood of ["warm", "bright", "dreamy"] as const) for (const preset of HARMONY_PRESETS) {
+    const before = createSongPlan(mood), after = applyHarmony(before, preset.id);
+    assert.equal(after.sections.length, before.sections.length);
+    assert.equal(songDuration(after), songDuration(before));
+    assert.deepEqual(after.patterns, before.patterns);
+    assert.deepEqual(after.mix, before.mix);
+    for (const field of ["title", "bpm", "key", "scale"] as const) assert.equal(after[field], before[field]);
+    after.sections.forEach((section, index) => {
+      const origin = before.sections[index];
+      assert.equal(section.chords.length, origin.chords.length);
+      assert.ok(section.chords.every(degree => Number.isInteger(degree) && degree >= 1 && degree <= 7));
+      for (const field of ["id", "title", "bars", "energy", "piano", "bass", "pad", "sourceRoles"] as const) assert.deepEqual(section[field], origin[field]);
+    });
+  }
+});
+
+test("末段最后一格落在该预设声明的收束级数上", () => {
+  for (const preset of HARMONY_PRESETS) {
+    const last = applyHarmony(createSongPlan("warm"), preset.id).sections.at(-1)!;
+    assert.equal(last.chords.at(-1), preset.cadence);
+  }
+});
+
+test("低能量的中段换进入口，段落之间不完全相同", () => {
+  const plan = applyHarmony(createSongPlan("warm"), "warm");
+  assert.deepEqual(plan.sections[0].chords, [1], "首段仍从主音开始");
+  const bodies = plan.sections.slice(1, -1).map(section => section.chords.join(","));
+  assert.ok(new Set(bodies).size > 1, "中段不应全都拿到一模一样的和弦循环");
+  const dip = plan.sections.slice(1, -1).reduce((low, section) => section.energy < low.energy ? section : low);
+  assert.equal(dip.chords[0], harmonyPreset("warm").dip);
+  for (const preset of HARMONY_PRESETS) assert.ok(preset.degrees.includes(preset.dip) && preset.degrees.includes(preset.cadence));
+});
+
+test("和声可来回切换并反查当前预设，未选过时反查为空", () => {
+  const plain = createSongPlan("warm");
+  assert.equal(matchHarmony(plain), null);
+  const first = applyHarmony(plain, "warm");
+  assert.equal(matchHarmony(first), "warm");
+  const second = applyHarmony(first, "night");
+  assert.equal(matchHarmony(second), "night");
+  assert.equal(matchHarmony(applyHarmony(second, "warm")), "warm");
+});
+
+test("未知和声预设抛出中文错误，应用结果仍通过完整校验", () => {
+  assert.throws(() => harmonyPreset("nope"), /没有这套和声感觉/);
+  assert.throws(() => applyHarmony(createSongPlan("warm"), "nope"), /没有这套和声感觉/);
+  const plan = applyHarmony(fixture(), "canon");
+  assert.deepEqual(validateSongPlan(plan), plan);
+});
+
+test("换和声后仍能展开出事件，音高不越界", () => {
+  for (const preset of HARMONY_PRESETS) {
+    const events = expandSong(applyHarmony(fixture(), preset.id));
+    assert.ok(events.notes.length > 0 && events.samples.length > 0);
+    assert.ok(events.notes.every(note => Number.isInteger(note.midi) && note.midi >= 24 && note.midi <= 108));
   }
 });

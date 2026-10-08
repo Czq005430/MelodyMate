@@ -84,6 +84,55 @@ export function createSongPlan(mood: "warm" | "bright" | "dreamy" = "warm"): Son
     ] });
 }
 
+export type HarmonyPreset = { id: string; label: string; hint: string; degrees: number[]; cadence: number; dip: number };
+
+// 级数均为统一调式内的 1～7 级；cadence 决定末段最后一格落在哪一级，dip 是低能量段的进入级数。
+export const HARMONY_PRESETS: HarmonyPreset[] = [
+  { id: "warm", label: "温暖安心", hint: "最常见的流行走向，怎么听都不会错", degrees: [1, 5, 6, 4], cadence: 1, dip: 6 },
+  { id: "nost", label: "怀旧微酸", hint: "老唱片、傍晚的感觉", degrees: [1, 6, 4, 5], cadence: 1, dip: 4 },
+  { id: "night", label: "夜色悬着", hint: "不落回主音，留一点没说完的感觉", degrees: [6, 4, 1, 5], cadence: 6, dip: 4 },
+  { id: "city", label: "都市夜行", hint: "二五一的爵士收束，稍微聪明一点", degrees: [2, 5, 1, 6], cadence: 1, dip: 6 },
+  { id: "canon", label: "想哭一点", hint: "卡农式下行，情绪一层层推上去", degrees: [1, 5, 6, 3, 4, 1, 4, 5], cadence: 1, dip: 4 },
+  { id: "open", label: "开阔向前", hint: "干净、往前走的四个和弦", degrees: [1, 4, 5, 6], cadence: 1, dip: 4 },
+  { id: "breathe", label: "呼吸留白", hint: "从四级开始，进入时更软", degrees: [4, 1, 5, 6], cadence: 1, dip: 5 },
+  { id: "sway", label: "来回摇摆", hint: "有点不安分，适合轻快的敲击", degrees: [1, 4, 6, 5], cadence: 1, dip: 6 },
+];
+
+export function harmonyPreset(id: string): HarmonyPreset {
+  const preset = HARMONY_PRESETS.find(item => item.id === id);
+  if (!preset) throw new Error("没有这套和声感觉，请从可选列表中选择");
+  return preset;
+}
+
+// 一套进行贯穿全曲是流行写法；段落对比落在能量最低的中段——换进入口，其余段保持同一进行。
+function harmonySections(preset: HarmonyPreset, sections: SongSection[]): number[][] {
+  const last = sections.length - 1;
+  const middles = sections.map((_, index) => index).filter(index => index > 0 && index < last);
+  const dipIndex = middles.length ? middles.reduce((best, index) => sections[index].energy < sections[best].energy ? index : best, middles[0]) : -1;
+  const dipOffset = preset.degrees.indexOf(preset.dip);
+  return sections.map((section, index) => {
+    const offset = index === dipIndex && dipOffset >= 0 ? dipOffset : 0;
+    const chords = section.chords.map((_, step) => preset.degrees[(offset + step) % preset.degrees.length]);
+    if (index === last) chords[chords.length - 1] = preset.cadence;
+    return chords;
+  });
+}
+
+// 只替换和弦级数，保留每段原有的和弦数量、配器、能量与结构。
+export function applyHarmony(plan: SongPlan, id: string): SongPlan {
+  const preset = harmonyPreset(id), valid = validateSongPlan(plan);
+  const chords = harmonySections(preset, valid.sections);
+  return validateSongPlan({ ...valid, sections: valid.sections.map((section, index) => ({ ...section, chords: chords[index] })) });
+}
+
+export function matchHarmony(plan: SongPlan): string | null {
+  const valid = validateSongPlan(plan);
+  return HARMONY_PRESETS.find(preset => {
+    const chords = harmonySections(preset, valid.sections);
+    return valid.sections.every((section, index) => section.chords.every((degree, position) => degree === chords[index][position]));
+  })?.id ?? null;
+}
+
 export function songDuration(plan: SongPlan): number { return durationOf(validateSongPlan(plan)); }
 export function sectionTimings(plan: SongPlan): Array<{ id: string; title: string; startSec: number; durationSec: number }> {
   const valid = validateSongPlan(plan); let startSec = 0;
